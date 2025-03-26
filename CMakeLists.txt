@@ -30,6 +30,12 @@ add_executable(${NAME}
     usb_descriptors.c
 )
 
+target_compile_definitions(${NAME}
+    PRIVATE
+        # If the debug configuration pass the DEBUG define to the compiler 
+        $<$<CONFIG:Debug>:DEBUG>
+)
+
 target_include_directories(${NAME} PUBLIC
         ${CMAKE_CURRENT_LIST_DIR})
 

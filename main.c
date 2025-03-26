@@ -26,9 +26,43 @@
 #define I2C_SDA  2
 #define I2C_SCL  3
 
+#define A0PIN 0
+
+// al3320a
+#define I2C_DEVICE_ADDRESS 0x1c
+
+#define UART_ID   uart0
+#define BAUD_RATE 115200
+
+// We are using pins 0 and 1, but see the GPIO function select table in the
+// datasheet for information on which other pins can be used.
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+
+uint8_t debug_buffer[256] = {0};
+
+void debug_print(const char* buffer) {
+#ifdef DEBUG
+    uart_puts(UART_ID, buffer);
+#endif
+}
+
+void debug_println(const char* buffer) {
+    debug_print(buffer);
+    debug_print("\r\n");
+}
+
 int main(void) {
     board_init();
     tusb_init();
+
+#ifdef DEBUG
+    uart_init(UART_ID, BAUD_RATE);
+    gpio_set_function(UART_TX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_TX_PIN));
+    gpio_set_function(UART_RX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_RX_PIN));
+#endif
+
+    debug_println("\033[2J");
 
     gpio_init(I2C_SDA);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
@@ -39,6 +73,14 @@ int main(void) {
     gpio_pull_up(I2C_SCL);
 
     i2c_init(I2C_INST, 100000);
+
+    adc_init();
+
+    // Make sure GPIO is high-impedance, no pullups etc
+    adc_gpio_init(26);
+
+    // Select ADC input 0 (GPIO26)
+    adc_select_input(A0PIN);
 
     while (1) {
         tud_task();
@@ -59,14 +101,14 @@ void tud_suspend_cb(bool remote_wakeup_en) {}
 // Invoked when usb bus is resumed
 void tud_resume_cb(void) {}
 
-/* commands from USB, must e.g. match command ids in kernel driver */
-#define CMD_ECHO       0
-#define CMD_GET_FUNC   1
-#define CMD_SET_DELAY  2
-#define CMD_GET_STATUS 3
-#define CMD_I2C_IO     4
-#define CMD_I2C_BEGIN  1  // flag fo I2C_IO
-#define CMD_I2C_END    2  // flag fo I2C_IO
+/* commands via USB, must match command ids in the firmware */
+#define CMD_ECHO         0
+#define CMD_GET_FUNC     1
+#define CMD_SET_DELAY    2
+#define CMD_GET_STATUS   3
+#define CMD_I2C_IO       4
+#define CMD_I2C_IO_BEGIN (1 << 0)
+#define CMD_I2C_IO_END   (1 << 1)
 
 const unsigned long i2c_func = I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 
@@ -77,12 +119,161 @@ const unsigned long i2c_func = I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 static uint8_t i2c_state = STATUS_IDLE;
 
 uint8_t i2c_data[1024] = {0};
+uint8_t adc_data[1024] = {0};
 
-/*uint8_t buffer[256] = {0};
-void debug_print(const char* buffer) {
-    tud_cdc_n_write(0, buffer, strlen(buffer));
-    tud_cdc_n_write_flush(0);
-}*/
+uint8_t reply_buf[64] = {0};
+
+bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request) {
+    if (stage != CONTROL_STAGE_SETUP && stage != CONTROL_STAGE_DATA) return true;
+    bool nostop = !(request->bRequest & CMD_I2C_IO_END);
+
+    debug_println("\n\n\n===>");
+
+    sprintf(debug_buffer, "%s i2c %s at 0x%02x, value = 0x%02x, len = %d, nostop = %d", (stage != CONTROL_STAGE_SETUP) ? "[D]" : "[S]",
+            (request->wValue & I2C_M_RD) ? "rd" : "wr", request->wIndex, request->wValue, request->wLength, nostop);
+    debug_println(debug_buffer);
+
+    if (request->wLength > sizeof(i2c_data)) {
+        return false;  // Prevent buffer overflow in case host sends us an impossible request
+    }
+
+    sprintf(debug_buffer, "stage 0x%02x, bRequest = 0x%02x, wValue = 0x%02x, wIndex = 0x%02x, wLength = 0x%02x", stage, request->bRequest, request->wValue,
+            request->wIndex, request->wLength);
+    debug_println(debug_buffer);
+
+    if (stage == CONTROL_STAGE_SETUP) {  // Before transfering data
+
+        if (request->wValue & I2C_M_RD) {
+            if (request->wIndex == I2C_DEVICE_ADDRESS) {
+                adc_data[0x07] = 0x04;
+
+                adc_select_input(0);
+
+                uint8_t  bytes[2];
+                uint16_t value = adc_read();
+
+                bytes[0] = *((uint8_t*) &(value) + 1);  // high byte (0x12)
+                bytes[1] = *((uint8_t*) &(value) + 0);  // low byte  (0x34)
+
+                adc_data[0x22] = bytes[0];
+                adc_data[0x23] = bytes[1];
+
+                sprintf(debug_buffer, "READ ADC 0x%04x 0x%02x 0x%02x", value, bytes[0], bytes[1]);
+                debug_println(debug_buffer);
+
+                // adc_select_input(1);
+                // adc_data[0] = adc_read();
+
+                // adc_select_input(2);
+                // adc_data[0] = adc_read();
+
+                // adc_select_input(3);
+                // adc_data[0] = adc_read();
+
+                i2c_state = STATUS_ADDRESS_ACK;
+
+            } else {
+                sprintf(debug_buffer, "READ I2C %i", i2c_data[0]);
+                debug_println(debug_buffer);
+
+                // Reading from I2C device
+                int res = i2c_read_blocking(I2C_INST, request->wIndex, i2c_data, request->wLength, nostop);
+                if (res == PICO_ERROR_GENERIC) {
+                    i2c_state = STATUS_ADDRESS_NAK;
+                } else {
+                    i2c_state = STATUS_ADDRESS_ACK;
+                }
+            }
+
+        } else if (request->wLength == 0) {  // Writing with length of 0, this is used for bus scanning, do dummy read
+
+            sprintf(debug_buffer, "SCAN INDEX = 0x%02x", request->wIndex);
+            debug_println(debug_buffer);
+
+            if (request->wIndex == I2C_DEVICE_ADDRESS) {
+                i2c_state = STATUS_ADDRESS_ACK;
+            } else {
+                uint8_t dummy = 0x00;
+                int     res   = i2c_read_blocking(I2C_INST, request->wIndex, (void*) &dummy, 1, nostop);
+                if (res == PICO_ERROR_GENERIC) {
+                    debug_println("NAK");
+                    i2c_state = STATUS_ADDRESS_NAK;
+                } else {
+                    debug_println("ACK");
+                    i2c_state = STATUS_ADDRESS_ACK;
+                }
+            }
+        }
+
+        if (request->wIndex == I2C_DEVICE_ADDRESS) {
+
+            if (request->wValue & I2C_M_RD) {
+              debug_println("I2C_M_RD");
+
+
+
+              int y=0;
+              uint16_t to_read = request->wLength;
+              while (to_read) {
+                uint16_t len = to_read;
+                if (len > sizeof(reply_buf)) {
+                  len = sizeof(reply_buf);
+                }
+                for (int i = 0; i < len; i++) {
+                  to_read--;
+                  adc_data[i] = adc_data[y];
+                  y++;
+
+            sprintf(debug_buffer,"%02X ",adc_data[i]);
+            debug_print(debug_buffer);
+                  // data_printf("%02X ",adc_data[i]);
+                }
+                // data_printf("\n");
+                
+                debug_println("");
+
+                if (!tud_control_xfer(rhport, request, reply_buf, len)) {
+                  // bbi2c_stop();
+                  // dbg_printf("Error in tud_control_xfer\n");
+                  return false;
+                }
+              }
+
+                // for (int i = 0; i < sizeof(adc_data); i++) {
+                //     reply_buf[0] = adc_data[i];
+                //     tud_control_xfer(rhport, request, (void*) adc_data, sizeof(adc_data));
+                // }
+            } else {
+                debug_println("!!!I2C_M_RD");
+
+                tud_control_xfer(rhport, request, (void*) adc_data, sizeof(adc_data));
+            }
+
+        } else {
+            tud_control_xfer(rhport, request, (void*) i2c_data, sizeof(i2c_data));
+        }
+    }
+
+    if (stage == CONTROL_STAGE_DATA) {        // After transfering data
+        if (!(request->wValue & I2C_M_RD)) {  // I2C write operation
+
+            if (request->wIndex == I2C_DEVICE_ADDRESS) {
+                // adc_data[request->wIndex] = 0; // TODO: fix!
+                i2c_state = STATUS_ADDRESS_ACK;
+
+            } else {
+                int res = i2c_write_blocking(I2C_INST, request->wIndex, i2c_data, request->wLength, nostop);
+                if (res == PICO_ERROR_GENERIC) {
+                    i2c_state = STATUS_ADDRESS_NAK;
+                } else {
+                    i2c_state = STATUS_ADDRESS_ACK;
+                }
+            }
+        }
+    }
+
+    return true;
+}
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request) {
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR) {
@@ -106,56 +297,14 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
                 return tud_control_status(rhport, request);
             case CMD_GET_STATUS:
                 if (stage != CONTROL_STAGE_SETUP) return true;
+                debug_println("GET STATUS!");
                 return tud_control_xfer(rhport, request, (void*) &i2c_state, sizeof(i2c_state));
             case CMD_I2C_IO:
-            case CMD_I2C_IO + CMD_I2C_BEGIN:
-            case CMD_I2C_IO + CMD_I2C_END:
-            case CMD_I2C_IO + CMD_I2C_BEGIN + CMD_I2C_END:
-                {
-                    if (stage != CONTROL_STAGE_SETUP && stage != CONTROL_STAGE_DATA) return true;
-                    bool nostop = !(request->bRequest & CMD_I2C_END);
+            case CMD_I2C_IO + CMD_I2C_IO_BEGIN:
+            case CMD_I2C_IO + CMD_I2C_IO_END:
+            case CMD_I2C_IO + CMD_I2C_IO_BEGIN + CMD_I2C_IO_END:
+                return handle_i2c(rhport, stage, request);
 
-                    //sprintf(buffer, "%s i2c %s at 0x%02x, len = %d, nostop = %d\r\n", (stage != CONTROL_STAGE_SETUP) ? "[D]" : "[S]", (request->wValue & I2C_M_RD)?"rd":"wr", request->wIndex, request->wLength, nostop);
-                    //debug_print(buffer);
-
-                    if (request->wLength > sizeof(i2c_data)) {
-                        return false;  // Prevent buffer overflow in case host sends us an impossible request
-                    }
-
-                    if (stage == CONTROL_STAGE_SETUP) {  // Before transfering data
-                        if (request->wValue & I2C_M_RD) {
-                            // Reading from I2C device
-                            int res = i2c_read_blocking(I2C_INST, request->wIndex, i2c_data, request->wLength, nostop);
-                            if (res == PICO_ERROR_GENERIC) {
-                                i2c_state = STATUS_ADDRESS_NAK;
-                            } else {
-                                i2c_state = STATUS_ADDRESS_ACK;
-                            }
-                        } else if (request->wLength == 0) {  // Writing with length of 0, this is used for bus scanning, do dummy read
-                            uint8_t dummy = 0x00;
-                            int     res   = i2c_read_blocking(I2C_INST, request->wIndex, (void*) &dummy, 1, nostop);
-                            if (res == PICO_ERROR_GENERIC) {
-                                i2c_state = STATUS_ADDRESS_NAK;
-                            } else {
-                                i2c_state = STATUS_ADDRESS_ACK;
-                            }
-                        }
-                        tud_control_xfer(rhport, request, (void*) i2c_data, request->wLength);
-                    }
-
-                    if (stage == CONTROL_STAGE_DATA) {        // After transfering data
-                        if (!(request->wValue & I2C_M_RD)) {  // I2C write operation
-                            int res = i2c_write_blocking(I2C_INST, request->wIndex, i2c_data, request->wLength, nostop);
-                            if (res == PICO_ERROR_GENERIC) {
-                                i2c_state = STATUS_ADDRESS_NAK;
-                            } else {
-                                i2c_state = STATUS_ADDRESS_ACK;
-                            }
-                        }
-                    }
-
-                    return true;
-                }
             default:
                 if (stage != CONTROL_STAGE_SETUP) return true;
                 break;
