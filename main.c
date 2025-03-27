@@ -22,9 +22,9 @@
 #include "tusb.h"
 #include "usb_descriptors.h"
 
-#define I2C_INST i2c1
-#define I2C_SDA  2
-#define I2C_SCL  3
+#define I2C_INST i2c0
+#define I2C_SDA  4
+#define I2C_SCL  5
 
 #define A0PIN 0
 
@@ -141,6 +141,15 @@ bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* req
             request->wIndex, request->wLength);
     debug_println(debug_buffer);
 
+    sprintf(debug_buffer, "i2c_data %x %x %x %x", i2c_data[0], i2c_data[1], i2c_data[2], i2c_data[3]);
+    debug_println(debug_buffer);
+
+    sprintf(debug_buffer, "adc_data %x %x %x %x", adc_data[0], adc_data[1], adc_data[2], adc_data[3]);
+    debug_println(debug_buffer);
+
+    sprintf(debug_buffer, "adc_data %x %x %x %x", reply_buf[0], reply_buf[1], reply_buf[2], reply_buf[3]);
+    debug_println(debug_buffer);
+
     if (stage == CONTROL_STAGE_SETUP) {  // Before transfering data
 
         if (request->wValue & I2C_M_RD) {
@@ -149,16 +158,17 @@ bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* req
 
                 adc_select_input(0);
 
-                uint8_t  bytes[2];
-                uint16_t value = adc_read();
+                // const float conversion_factor = 3.3f / (1 << 12);
 
-                bytes[0] = *((uint8_t*) &(value) + 1);  // high byte (0x12)
-                bytes[1] = *((uint8_t*) &(value) + 0);  // low byte  (0x34)
+                uint16_t value = adc_read();  // * conversion_factor;
 
-                adc_data[0x22] = bytes[0];
-                adc_data[0x23] = bytes[1];
+                uint8_t high = *((uint8_t*) &(value) + 1);  // high byte (0x12)
+                uint8_t low  = *((uint8_t*) &(value) + 0);  // low byte  (0x34)
 
-                sprintf(debug_buffer, "READ ADC 0x%04x 0x%02x 0x%02x", value, bytes[0], bytes[1]);
+                adc_data[0x22] = low;
+                adc_data[0x23] = high;
+
+                sprintf(debug_buffer, "READ ADC 0x%04x high 0x%02x low 0x%02x", value, high, low);
                 debug_println(debug_buffer);
 
                 // adc_select_input(1);
@@ -173,11 +183,11 @@ bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* req
                 i2c_state = STATUS_ADDRESS_ACK;
 
             } else {
-                sprintf(debug_buffer, "READ I2C %i", i2c_data[0]);
+                sprintf(debug_buffer, "READ I2C %i", reply_buf[0]);
                 debug_println(debug_buffer);
 
                 // Reading from I2C device
-                int res = i2c_read_blocking(I2C_INST, request->wIndex, i2c_data, request->wLength, nostop);
+                int res = i2c_read_blocking(I2C_INST, request->wIndex, (void*) reply_buf, request->wLength, nostop);
                 if (res == PICO_ERROR_GENERIC) {
                     i2c_state = STATUS_ADDRESS_NAK;
                 } else {
@@ -206,51 +216,16 @@ bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* req
         }
 
         if (request->wIndex == I2C_DEVICE_ADDRESS) {
+            int startAdress = reply_buf[0];
 
-            if (request->wValue & I2C_M_RD) {
-              debug_println("I2C_M_RD");
-
-
-
-              int y=0;
-              uint16_t to_read = request->wLength;
-              while (to_read) {
-                uint16_t len = to_read;
-                if (len > sizeof(reply_buf)) {
-                  len = sizeof(reply_buf);
-                }
-                for (int i = 0; i < len; i++) {
-                  to_read--;
-                  adc_data[i] = adc_data[y];
-                  y++;
-
-            sprintf(debug_buffer,"%02X ",adc_data[i]);
-            debug_print(debug_buffer);
-                  // data_printf("%02X ",adc_data[i]);
-                }
-                // data_printf("\n");
-                
-                debug_println("");
-
-                if (!tud_control_xfer(rhport, request, reply_buf, len)) {
-                  // bbi2c_stop();
-                  // dbg_printf("Error in tud_control_xfer\n");
-                  return false;
-                }
-              }
-
-                // for (int i = 0; i < sizeof(adc_data); i++) {
-                //     reply_buf[0] = adc_data[i];
-                //     tud_control_xfer(rhport, request, (void*) adc_data, sizeof(adc_data));
-                // }
-            } else {
-                debug_println("!!!I2C_M_RD");
-
-                tud_control_xfer(rhport, request, (void*) adc_data, sizeof(adc_data));
+            for (uint8_t i = 0; i < request->wLength; i++) {
+                reply_buf[i] = adc_data[startAdress + i];
             }
 
+            tud_control_xfer(rhport, request, (void*) reply_buf, request->wLength);
+
         } else {
-            tud_control_xfer(rhport, request, (void*) i2c_data, sizeof(i2c_data));
+            tud_control_xfer(rhport, request, (void*) reply_buf, request->wLength);
         }
     }
 
