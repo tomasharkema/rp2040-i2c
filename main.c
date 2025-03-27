@@ -39,6 +39,32 @@
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1
 
+#define __bf_shf(x) (__builtin_ffsll(x) - 1)
+
+
+#define __GENMASK(h, l) (((~_UL(0)) << (l)) & (~_UL(0) >> (BITS_PER_LONG - 1 - (h))))
+
+#define GENMASK_INPUT_CHECK(h, l) 0
+
+#define GENMASK(h, l) \
+	(GENMASK_INPUT_CHECK(h, l) + __GENMASK(h, l))
+#define GENMASK_ULL(h, l) \
+	(GENMASK_INPUT_CHECK(h, l) + __GENMASK_ULL(h, l))
+
+
+
+#define FIELD_PREP(_mask, _val)						\
+	({								\
+		((typeof(_mask))(_val) << __bf_shf(_mask)) & (_mask);	\
+	})
+
+#define AL3320A_GAIN_MASK 0x00000006 // GENMASK(2,1)
+
+uint8_t i2c_data[1024] = {0};
+uint8_t adc_data[1024] = {0};
+
+uint8_t reply_buf[64] = {0};
+
 uint8_t debug_buffer[256] = {0};
 
 void debug_print(const char* buffer) {
@@ -82,6 +108,8 @@ int main(void) {
     // Select ADC input 0 (GPIO26)
     adc_select_input(A0PIN);
 
+    adc_data[0x07] = FIELD_PREP(AL3320A_GAIN_MASK, 0); // eq. 0.128
+
     while (1) {
         tud_task();
     }
@@ -118,10 +146,6 @@ const unsigned long i2c_func = I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 
 static uint8_t i2c_state = STATUS_IDLE;
 
-uint8_t i2c_data[1024] = {0};
-uint8_t adc_data[1024] = {0};
-
-uint8_t reply_buf[64] = {0};
 
 bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request) {
     if (stage != CONTROL_STAGE_SETUP && stage != CONTROL_STAGE_DATA) return true;
@@ -141,26 +165,25 @@ bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* req
             request->wIndex, request->wLength);
     debug_println(debug_buffer);
 
-    sprintf(debug_buffer, "i2c_data %x %x %x %x", i2c_data[0], i2c_data[1], i2c_data[2], i2c_data[3]);
+    sprintf(debug_buffer, "i2c_data 0x%02x 0x%02x 0x%02x 0x%02x", i2c_data[0], i2c_data[1], i2c_data[2], i2c_data[3]);
     debug_println(debug_buffer);
 
-    sprintf(debug_buffer, "adc_data %x %x %x %x", adc_data[0], adc_data[1], adc_data[2], adc_data[3]);
+    sprintf(debug_buffer, "adc_data 0x%02x 0x%02x 0x%02x 0x%02x", adc_data[0], adc_data[1], adc_data[2], adc_data[3]);
     debug_println(debug_buffer);
 
-    sprintf(debug_buffer, "adc_data %x %x %x %x", reply_buf[0], reply_buf[1], reply_buf[2], reply_buf[3]);
+    sprintf(debug_buffer, "adc_data 0x%02x 0x%02x 0x%02x 0x%02x", reply_buf[0], reply_buf[1], reply_buf[2], reply_buf[3]);
     debug_println(debug_buffer);
 
     if (stage == CONTROL_STAGE_SETUP) {  // Before transfering data
 
         if (request->wValue & I2C_M_RD) {
             if (request->wIndex == I2C_DEVICE_ADDRESS) {
-                adc_data[0x07] = 0x04;
 
                 adc_select_input(0);
 
                 // const float conversion_factor = 3.3f / (1 << 12);
 
-                uint16_t value = adc_read();  // * conversion_factor;
+                uint16_t value = adc_read() * 0.7;
 
                 uint8_t high = *((uint8_t*) &(value) + 1);  // high byte (0x12)
                 uint8_t low  = *((uint8_t*) &(value) + 0);  // low byte  (0x34)
@@ -233,7 +256,13 @@ bool handle_i2c(uint8_t rhport, uint8_t stage, tusb_control_request_t const* req
         if (!(request->wValue & I2C_M_RD)) {  // I2C write operation
 
             if (request->wIndex == I2C_DEVICE_ADDRESS) {
-                // adc_data[request->wIndex] = 0; // TODO: fix!
+                // adc_data[request->wIndex] = 0; // TODO: fix
+
+                sprintf(debug_buffer, "write adc_data 0x%02x 0x%02x 0x%02x 0x%02x", adc_data[0x06], adc_data[0x07], adc_data[0x08], adc_data[0x09]);
+                debug_println(debug_buffer);
+                sprintf(debug_buffer, "write reply_buf 0x%02x 0x%02x 0x%02x 0x%02x", reply_buf[0x06], reply_buf[0x07], reply_buf[0x08], reply_buf[0x09]);
+                debug_println(debug_buffer);
+
                 i2c_state = STATUS_ADDRESS_ACK;
 
             } else {
